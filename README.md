@@ -1,6 +1,24 @@
-# 企业知识库问答助手
+# Corporate Knowledge Agent
 
-面向企业知识管理场景的 **RAG + Agent 智能问答系统**
+面向企业知识管理场景的 **RAG + Agent 智能问答系统**。
+
+该项目集成了：
+- FastAPI 后端
+- Streamlit 前端
+- FAISS 向量检索
+- BGE 中文 Embedding
+- BM25 关键词召回
+- Cross-Encoder 重排
+- DeepSeek / OpenAI 兼容的 LLM 接口
+- SSE 流式回答输出
+
+## 项目目标
+
+用于企业内部文档知识问答场景，支持：
+- 文档上传与分块索引
+- 文档检索 + Agent 推理
+- 多轮问答历史记录
+- Docker 一键部署
 
 ## 🚀 v2.0 核心升级
 
@@ -75,9 +93,9 @@ Ragagent/
 ### 方式一：Docker Compose
 
 ```bash
-# 1. 配置 API Key
+# 1. 复制环境变量模板
 cp .env.example .env
-# 编辑 .env 填入 DEEPSEEK_API_KEY
+# 编辑 .env，至少补充 DEEPSEEK_API_KEY
 
 # 2. 一键启动
 docker compose up -d
@@ -106,3 +124,18 @@ cd frontend
 pip install -r requirements.txt
 streamlit run app.py
 ```
+
+## 🔐 环境变量说明
+
+请在项目根目录复制一份 [.env.example](.env.example) 为 `.env`，并填写：
+- `DEEPSEEK_API_KEY`
+- `DEEPSEEK_API_URL`（可选）
+- `DEEPSEEK_MODEL`（可选）
+
+注意：
+- `.env` 不会上传到 GitHub
+- 代码通过 `load_dotenv` 从项目根目录读取本地配置
+
+## ✅ 代码检查结论
+
+本项目核心源码已完成语法级验证，前后端入口文件均为可执行状态。执行实际检验时，`python -m py_compile` 对关键 Python 文件没有报错，因此这次提交适合作为 GitHub 的公开代码仓库快照。
