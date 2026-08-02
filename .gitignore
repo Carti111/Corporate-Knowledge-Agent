@@ -1,0 +1,43 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local environment secrets
+.env
+.env.*
+!.env.example
+
+# IDE/editor
+.vscode/
+.idea/
+.agents/
+.claude/
+.DS_Store
+Thumbs.db
+
+# Docker/build artifacts
+build/
+dist/
+*.log
+
+# Generated runtime data
+backend/data/uploads/*
+backend/data/faiss_index.*
+backend/data/conversation_history.json
+
+# Large local model assets - keep locally, do not upload
+models/
+*.bin
+*.safetensors
