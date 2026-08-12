@@ -6,6 +6,7 @@ import json
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 import httpx
+from loguru import logger
 
 from .config import settings
 
@@ -58,7 +59,8 @@ class LLMService:
             response.raise_for_status()
             data = response.json()
             return data["choices"][0]["message"]["content"].strip()
-        except Exception:
+        except Exception as e:
+            logger.error(f"LLM API 调用失败: {type(e).__name__}: {e}")
             return self._fallback_answer(question, contexts)
 
     # ------------------------------------------------------------------
@@ -115,7 +117,8 @@ class LLMService:
                                     yield content
                             except json.JSONDecodeError:
                                 continue
-        except Exception:
+        except Exception as e:
+            logger.error(f"LLM 流式 API 调用失败: {type(e).__name__}: {e}")
             yield self._fallback_answer(question, contexts)
 
     # ------------------------------------------------------------------
@@ -138,8 +141,26 @@ class LLMService:
     def _fallback_answer(
         self, question: str, contexts: List[Dict[str, Any]]
     ) -> str:
+        """LLM API 不可用时的本地兜底回答：基于检索到的文档内容合成回答。"""
+        if not contexts:
+            return "当前知识库中还没有可用文档，请先上传企业文档后再提问。"
+
         sources = ", ".join([item["title"] for item in contexts])
+
+        # 从检索到的上下文中提取关键段落
+        snippets: List[str] = []
+        for item in contexts:
+            chunk_text = item.get("chunk", "")
+            # 取每个 chunk 的前 300 个字符作为摘要
+            if chunk_text:
+                snippets.append(f"【{item['title']}】{chunk_text[:300]}")
+
+        combined = "\n".join(snippets)
+
         return (
-            f"根据检索到的文档内容，我给出以下回答：{question}。"
-            f"参考来源包括：{sources}。"
+            f"根据已检索到的企业文档内容，为您整理如下：\n\n"
+            f"{combined}\n\n"
+            f"---\n"
+            f"（注：当前 LLM 服务不可用，以上为直接检索匹配的文档原文片段。"
+            f"参考来源：{sources}。）"
         )

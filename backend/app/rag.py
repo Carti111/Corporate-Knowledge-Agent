@@ -21,6 +21,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import httpx
 import numpy as np
 
 try:
@@ -274,10 +275,14 @@ def _diverse_final_output(
     reranked: List[tuple],
     top_k: int = 4,
 ) -> List[dict]:
-    """最终多样性输出：每文档至少取 top-1，剩余按重排序分数填充。"""
-    # Round 1: 每个 source 取最高分
-    source_best: Dict[str, tuple] = {}  # source → (chunk, score)
-    source_others: List[tuple] = []  # 其余 chunk
+    """智能多样性输出：高分文档可独占多个席位，低分文档仅保留代表。
+
+    规则（按优先级）：
+    1. 如果有文档得分 >= 0.8 且其他文档均 < 0.4，该文档独占 top_k - 1 席，留 1 席给次高分文档
+    2. 否则：高分文档（>= 0.6 * max）优先分配，低分文档保留至多 1 席
+    """
+    source_best: Dict[str, tuple] = {}
+    source_others: List[tuple] = []
 
     for chunk, score in reranked:
         source = chunk.source
@@ -286,31 +291,19 @@ def _diverse_final_output(
         else:
             source_others.append((chunk, round(float(score), 4)))
 
-    # 先输出每文档 top-1
+    if not source_best:
+        return []
+
+    max_score = max(score for _, score in source_best.values())
+    sorted_best = sorted(source_best.values(), key=lambda x: x[1], reverse=True)
+
     results: List[dict] = []
     seen_content: set = set()
-    for chunk, score in sorted(source_best.values(), key=lambda x: x[1], reverse=True):
-        content_key = chunk.content[:80]
-        if content_key in seen_content:
-            continue
-        seen_content.add(content_key)
-        results.append({
-            "score": score,
-            "chunk": chunk.content,
-            "source": chunk.source,
-            "title": chunk.title,
-            "page": chunk.page,
-        })
-        if len(results) >= top_k:
-            return results
 
-    # Round 2: 剩余按分数填充
-    for chunk, score in sorted(source_others, key=lambda x: x[1], reverse=True):
-        if len(results) >= top_k:
-            break
+    def _add(chunk: DocumentChunk, score: float) -> bool:
         content_key = chunk.content[:80]
         if content_key in seen_content:
-            continue
+            return False
         seen_content.add(content_key)
         results.append({
             "score": score,
@@ -319,6 +312,62 @@ def _diverse_final_output(
             "title": chunk.title,
             "page": chunk.page,
         })
+        return True
+
+    # 判断是否为"一家独大"场景
+    dominant = (
+        len(sorted_best) >= 2
+        and sorted_best[0][1] >= 0.8
+        and sorted_best[1][1] < 0.4
+    )
+    logger.info(
+        f"多样性输出: dominant={dominant}, max={max_score:.2f}, "
+        f"top2_scores=[{sorted_best[0][1]:.2f} ({sorted_best[0][0].source}), "
+        f"{sorted_best[1][1] if len(sorted_best) >= 2 else 'N/A'}]"
+    )
+
+    if dominant:
+        # 主力文档独占大部分席位
+        dominant_source = sorted_best[0][0].source
+        # Round 1: 主力文档的所有 chunk（按分数排序）
+        all_dominant = [(c, s) for c, s in reranked if c.source == dominant_source]
+        for chunk, score in all_dominant:
+            if len(results) >= top_k - 1:
+                break
+            _add(chunk, score)
+        # Round 2: 给次高分文档留 1 席（提供不同视角）
+        for chunk, score in sorted_best[1:]:
+            if len(results) >= top_k:
+                break
+            _add(chunk, score)
+        # 如果还不到 top_k，继续加主力文档的 chunk
+        if len(results) < top_k:
+            for chunk, score in all_dominant:
+                if len(results) >= top_k:
+                    break
+                _add(chunk, score)
+    else:
+        # 常规场景：每文档至少 1 席，高分文档可以多占
+        primary_docs = set()
+        secondary_docs = set()
+        for chunk, score in sorted_best:
+            if score >= max_score * 0.5:
+                primary_docs.add(chunk.source)
+            else:
+                secondary_docs.add(chunk.source)
+
+        # 每文档先给 1 席
+        for chunk, score in sorted_best:
+            if len(results) >= top_k:
+                break
+            _add(chunk, score)
+
+        # 剩余席位按分数填充（不限文档）
+        if len(results) < top_k:
+            for chunk, score in sorted(source_others, key=lambda x: x[1], reverse=True):
+                if len(results) >= top_k:
+                    break
+                _add(chunk, score)
 
     return results
 
@@ -361,7 +410,7 @@ def reciprocal_rank_fusion(
 # ---------------------------------------------------------------------------
 
 class Reranker:
-    """Cross-Encoder 重排序器。"""
+    """Cross-Encoder 重排序器，本地模型不可用时自动降级为 LLM 重排序。"""
 
     def __init__(self, model_dir: Optional[str] = None):
         self.model_dir = model_dir or settings.reranker_model_dir
@@ -372,7 +421,7 @@ class Reranker:
         if CrossEncoder is None:
             return
         if not self.model_dir or not os.path.isdir(self.model_dir):
-            logger.info("Reranker 模型未找到，将跳过重排序")
+            logger.info("Reranker 模型未找到，将使用 LLM 重排序")
             return
         try:
             self.model = CrossEncoder(self.model_dir)
@@ -381,6 +430,76 @@ class Reranker:
             logger.warning(f"Reranker 加载失败: {e}")
             self.model = None
 
+    def _llm_rerank(
+        self,
+        question: str,
+        chunks: List[DocumentChunk],
+        top_k: int = 4,
+    ) -> List[tuple]:
+        """使用 DeepSeek API 进行 LLM 重排序。
+
+        将候选分块发送给 LLM，要求其按相关性打分（0-10），再按分数排序。
+        """
+        if not settings.deepseek_api_key:
+            return _apply_fallback_scores(chunks, None)[:top_k]
+
+        # 构建打分请求（限制候选数以减少 token 消耗）
+        candidates_text = ""
+        for i, chunk in enumerate(chunks[:20]):  # 最多 20 个候选
+            # 每段取前 350 字符，足以让 LLM 判断内容相关性
+            snippet = chunk.content[:350].replace("\n", " ")
+            candidates_text += f"[{i}] 来源:{chunk.title} | {snippet}\n"
+
+        prompt = (
+            f"问题：{question}\n\n"
+            f"候选文档片段：\n{candidates_text}\n"
+            "请对每个候选片段与问题的相关度打分（0-10，10 分最相关），"
+            "只返回 JSON 数组，格式：[{\"id\": 编号, \"score\": 分数}, ...]"
+            "，按分数从高到低排列。只返回 JSON，不要其他内容。"
+        )
+
+        try:
+            response = httpx.post(
+                f"{settings.deepseek_api_url.rstrip('/')}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {settings.deepseek_api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": settings.deepseek_model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.1,
+                    "stream": False,
+                },
+                timeout=30.0,
+            )
+            response.raise_for_status()
+            data = response.json()
+            content = data["choices"][0]["message"]["content"].strip()
+
+            # 解析 JSON 数组
+            # 处理 markdown 代码块包裹的情况
+            if content.startswith("```"):
+                content = content.split("\n", 1)[1]
+                if content.endswith("```"):
+                    content = content[:-3]
+            scored = json.loads(content)
+
+            # 按 LLM 分数排序
+            id_score_map = {item["id"]: item["score"] / 10.0 for item in scored}
+            ranked = []
+            for i, chunk in enumerate(chunks):
+                score = id_score_map.get(i, 0.0)
+                ranked.append((chunk, score))
+            ranked.sort(key=lambda x: x[1], reverse=True)
+
+            logger.info(f"LLM 重排序完成: {len(ranked)} 候选 → top {top_k}")
+            return ranked[:top_k]
+
+        except Exception as e:
+            logger.warning(f"LLM 重排序失败: {e}")
+            return _apply_fallback_scores(chunks, None)[:top_k]
+
     def rerank(
         self,
         question: str,
@@ -388,28 +507,29 @@ class Reranker:
         top_k: int = 4,
         fallback_scores: Optional[Dict[int, float]] = None,
     ) -> List[tuple]:
-        """重排序返回 [(chunk, score), ...]，按分数降序。
+        """重排序返回 [(chunk, score), ...]，按分数降序。"""
+        if not chunks:
+            return []
 
-        fallback_scores: {chunk_index: score} 当 reranker 不可用时使用 RRF 融合分数作为回退。
-        """
-        if self.model is None or not chunks:
-            logger.info("Reranker 不可用，使用 RRF 融合分数")
-            return _apply_fallback_scores(chunks, fallback_scores)[:top_k]
+        if self.model is not None:
+            # 本地 Cross-Encoder 可用
+            try:
+                pairs = [(question, chunk.content) for chunk in chunks]
+                scores = self.model.predict(pairs)
+                if isinstance(scores, float):
+                    scores = [scores]
+                ranked = sorted(
+                    zip(chunks, scores),
+                    key=lambda x: float(x[1]),
+                    reverse=True,
+                )
+                return ranked[:top_k]
+            except Exception as e:
+                logger.warning(f"Reranker 执行失败: {e}")
 
-        try:
-            pairs = [(question, chunk.content) for chunk in chunks]
-            scores = self.model.predict(pairs)
-            if isinstance(scores, float):
-                scores = [scores]
-            ranked = sorted(
-                zip(chunks, scores),
-                key=lambda x: float(x[1]),
-                reverse=True,
-            )
-            return ranked[:top_k]
-        except Exception as e:
-            logger.warning(f"Reranker 执行失败: {e}")
-            return _apply_fallback_scores(chunks, fallback_scores)[:top_k]
+        # 本地模型不可用 → LLM 重排序
+        logger.info("使用 LLM 进行重排序")
+        return self._llm_rerank(question, chunks, top_k)
 
 
 # ---------------------------------------------------------------------------
@@ -649,64 +769,14 @@ class RAGService:
                 fallback_scores[pos] = fused[idx]
 
         # 5. Cross-Encoder 重排序（传入 fallback 分数）
-        rerank_k = max(settings.rerank_top_k, top_k * 2)
+        # 增大候选池让同一文档的多条相关分块都有机会进入
+        rerank_k = max(settings.rerank_top_k, top_k * 4)
         reranked = self.reranker.rerank(
             question, candidate_chunks, top_k=rerank_k, fallback_scores=fallback_scores
         )
 
         # 6. 最终多样性输出：每文档至少取 top-1，剩余按重排序分数填充
         results = _diverse_final_output(reranked, top_k=top_k)
-
-        # 6b. 输出端文档覆盖兜底：确保每份文档至少有一条
-        #     如果 results 已满，替换掉最低分的重复来源项
-        covered_sources = {r["source"] for r in results}
-        all_sources = {doc["source"] for doc in self.documents}
-        missing_sources = all_sources - covered_sources
-        if missing_sources and len(self.documents) <= 20:
-            for src in missing_sources:
-                # 找到该文档的代表 chunk（优先 reranked，再 candidate，再全量）
-                found_data = None
-                for chunk, score in reranked:
-                    if chunk.source == src:
-                        found_data = {
-                            "score": round(float(score), 4),
-                            "chunk": chunk.content,
-                            "source": chunk.source,
-                            "title": chunk.title,
-                            "page": chunk.page,
-                        }
-                        break
-                if found_data is None:
-                    for chunk in candidate_chunks:
-                        if chunk.source == src:
-                            found_data = {
-                                "score": 0.01, "chunk": chunk.content,
-                                "source": chunk.source, "title": chunk.title,
-                                "page": chunk.page,
-                            }
-                            break
-                if found_data is None:
-                    for chunk in self.chunks:
-                        if chunk.source == src:
-                            found_data = {
-                                "score": 0.01, "chunk": chunk.content,
-                                "source": chunk.source, "title": chunk.title,
-                                "page": chunk.page,
-                            }
-                            break
-                if found_data is None:
-                    continue
-
-                if len(results) < top_k:
-                    results.append(found_data)
-                else:
-                    # 替换掉最低分的、且来源有重复的结果
-                    # 按 score 升序找第一个来源重复的项
-                    for i in sorted(range(len(results)), key=lambda j: results[j]["score"]):
-                        src_i = results[i]["source"]
-                        if sum(1 for r in results if r["source"] == src_i) > 1:
-                            results[i] = found_data
-                            break
 
         logger.info(
             f"检索完成: 语义={len(semantic_results)}, BM25={len(bm25_results)}, "

@@ -41,7 +41,7 @@ class Settings(BaseSettings):
     # Retrieval settings
     retrieval_top_k: int = int(os.getenv("RETRIEVAL_TOP_K", "10"))
     rerank_top_k: int = int(os.getenv("RERANK_TOP_K", "10"))
-    hybrid_alpha: float = float(os.getenv("HYBRID_ALPHA", "0.5"))
+    hybrid_alpha: float = float(os.getenv("HYBRID_ALPHA", "0.8"))
 
     upload_dir: Path = UPLOAD_DIR
 
