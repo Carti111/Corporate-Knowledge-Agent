@@ -11,7 +11,7 @@
 | 页面 | 功能 |
 |------|------|
 | 💬 **问答** | 对话气泡 + 底部输入框，SSE 流式逐字输出，来源引用 + Agent 推理计划可展开 |
-| 📚 **知识库管理** | 卡片式文档网格，支持 PDF/TXT 上传、预览、删除，实时显示索引状态 |
+| 📚 **知识库管理** | 卡片式文档网格，支持 PDF / TXT / CSV / Excel (.xlsx, .xls) 上传、预览、删除，实时显示索引状态 |
 | 📋 **对话管理** | 历史对话搜索、浏览、导出 JSON，一键加载旧对话继续提问 |
 
 ---
@@ -20,12 +20,12 @@
 
 ```
 用户问题
-  -> ReAct Agent 分析意图，决定是否检索及使用何种工具
+  -> ReAct Agent 分析意图（默认优先检索，覆盖制度/流程/表格/数据等所有场景）
   -> BGE Embedding 向量化
   -> FAISS 语义检索 + BM25 关键词检索（并行）
   -> RRF 融合排序
   -> Cross-Encoder 重排序（本地模型不可用时自动切换 LLM 重排序）
-  -> 多样性输出（智能检测高分文档，避免单一文档垄断）
+  -> 多样性输出（智能检测高分文档 + 最低分数门槛，避免无关文档混入结果）
   -> LLM 生成回答（SSE 流式输出）
   -> 返回答案 + 来源引用 + Agent 推理链路
 ```
@@ -39,7 +39,7 @@ Agent 采用 **ReAct**（Reasoning + Acting）范式，不再依赖关键词规�
 - `summarize_topic` — 汇总某个主题下的所有相关内容
 - `no_tools_needed` — 无需检索，直接回答（问候、闲聊等）
 
-Agent 支持多步推理：对复杂问题会多次调用工具，每步输出思考过程，最终形成完整的可解释推理链路。当 API 不可用时，自动降级为本地兜底回答，输出检索到的文档原文片段。
+Agent 采用默认优先检索策略：只要不是简单的问候/道别/感谢，一律先查知识库，确保不会遗漏相关信息。支持多步推理：对复杂问题会多次调用工具，每步输出思考过程，最终形成完整的可解释推理链路。当 API 不可用时，自动降级为本地兜底回答，输出检索到的文档原文片段。
 
 ## 混合检索
 
@@ -70,7 +70,9 @@ Agent 支持多步推理：对复杂问题会多次调用工具，每步输出�
 | 语义检索 | BGE-large-zh-v1.5（1024 维） |
 | 关键词检索 | BM25（Okapi） |
 | 融合策略 | RRF（Reciprocal Rank Fusion） |
+| 文件解析 | pypdf (PDF), openpyxl/xlrd (Excel), csv, txt |
 | 重排序 | Cross-Encoder Reranker / LLM 重排序（fallback） |
+| 多样性 | 智能 dominant 检测 + 最低分数门槛过滤 |
 | Agent | ReAct + Function Calling |
 | LLM | DeepSeek Chat API（兼容 OpenAI 格式） |
 | 流式输出 | Server-Sent Events（SSE） |
@@ -137,7 +139,16 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-启动后访问前端 http://localhost:8501，API 文档 http://localhost:8000/docs。
+启动后访问前端 http://localhost:8501，API 文档 http://localhost:8001/docs。
+
+### 支持的文件格式
+
+| 格式 | 扩展名 | 说明 |
+|------|--------|------|
+| PDF | `.pdf` | 自动提取文本 |
+| 文本 | `.txt` | UTF-8 编码 |
+| CSV | `.csv` | 自动转为表格文本 |
+| Excel | `.xlsx`, `.xls` | 多工作表支持，每个工作表独立标注 |
 
 ### 模型准备
 

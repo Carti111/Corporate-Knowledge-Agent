@@ -10,7 +10,7 @@ import time
 import requests
 import streamlit as st
 
-API_BASE = os.getenv("API_BASE", "http://127.0.0.1:8000")
+API_BASE = os.getenv("API_BASE", "http://127.0.0.1:8001")
 
 # ---------------------------------------------------------------------------
 # 页面配置
@@ -223,6 +223,8 @@ st.markdown("""
     }
     .doc-icon.pdf { background: #fef2f2; color: #dc2626; }
     .doc-icon.txt { background: #eff6ff; color: #2563eb; }
+    .doc-icon.csv { background: #f0fdf4; color: #16a34a; }
+    .doc-icon.xlsx, .doc-icon.xls { background: #fefce8; color: #ca8a04; }
 
     /* ===== 对话历史条目 ===== */
     .history-item {
@@ -672,7 +674,7 @@ elif page == "知识库管理":
     with upload_col1:
         uploaded_files = st.file_uploader(
             "选择 PDF 或 TXT 文件",
-            type=["pdf", "txt"],
+            type=["pdf", "txt", "csv", "xlsx", "xls"],
             accept_multiple_files=True,
             label_visibility="collapsed",
             key="kb_uploader",
@@ -719,8 +721,13 @@ elif page == "知识库管理":
         for i, doc in enumerate(docs):
             with cols[i % 2]:
                 ext = doc["source"].split(".")[-1] if "." in doc["source"] else "txt"
-                icon_class = "pdf" if ext == "pdf" else "txt"
-                icon = "📕" if ext == "pdf" else "📄"
+                icon_map = {
+                    "pdf": ("pdf", "📕"),
+                    "csv": ("csv", "📊"),
+                    "xlsx": ("xlsx", "📈"),
+                    "xls": ("xls", "📈"),
+                }
+                icon_class, icon = icon_map.get(ext, ("txt", "📄"))
 
                 st.markdown(f"""
                 <div class="doc-card card-hover" style="margin-bottom:0.75rem;">

@@ -347,17 +347,24 @@ def _diverse_final_output(
                     break
                 _add(chunk, score)
     else:
-        # 常规场景：每文档至少 1 席，高分文档可以多占
+        # 常规场景：每文档至少 1 席，但跳过与问题完全无关的低分文档
         primary_docs = set()
         secondary_docs = set()
+        # 最低分数门槛：max_score 的 15%，低于此值的文档视为无关
+        min_score_threshold = max(max_score * 0.15, 0.05)
+
+        eligible_sorted_best = [
+            (c, s) for c, s in sorted_best if s >= min_score_threshold
+        ]
+
         for chunk, score in sorted_best:
             if score >= max_score * 0.5:
                 primary_docs.add(chunk.source)
             else:
                 secondary_docs.add(chunk.source)
 
-        # 每文档先给 1 席
-        for chunk, score in sorted_best:
+        # 每文档先给 1 席（仅限过门槛的文档）
+        for chunk, score in eligible_sorted_best:
             if len(results) >= top_k:
                 break
             _add(chunk, score)
@@ -1012,7 +1019,7 @@ class RAGService:
         if not upload_dir.exists():
             return
         for file_path in upload_dir.iterdir():
-            if file_path.is_file() and file_path.suffix.lower() in (".txt", ".pdf"):
+            if file_path.is_file() and file_path.suffix.lower() in (".txt", ".pdf", ".csv", ".xlsx", ".xls"):
                 filename = file_path.name
                 if any(doc["source"] == filename for doc in self.documents):
                     continue
@@ -1094,14 +1101,88 @@ def chunk_text(
 
 
 # ---------------------------------------------------------------------------
-# PDF 文本提取
+# 文件文本提取
 # ---------------------------------------------------------------------------
 
+def _excel_to_text(path: Path) -> str:
+    """将 Excel (.xlsx / .xls) 所有工作表转为可检索的文本。"""
+    suffix = path.suffix.lower()
+    if suffix == ".xlsx":
+        import openpyxl
+
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        sheet_names = wb.sheetnames
+    else:
+        import xlrd
+
+        wb = xlrd.open_workbook(str(path))
+        sheet_names = wb.sheet_names()
+
+    parts: list[str] = [f"以下为表格文件 [{path.stem}] 的内容：\n"]
+
+    for sheet_name in sheet_names:
+        if suffix == ".xlsx":
+            ws = wb[sheet_name]
+            rows = [[str(cell.value or "") for cell in row] for row in ws.iter_rows()]
+        else:
+            ws = wb.sheet_by_name(sheet_name)
+            rows = [[str(ws.cell_value(r, c) or "") for c in range(ws.ncols)] for r in range(ws.nrows)]
+
+        if not rows:
+            continue
+
+        parts.append(f"## 工作表：{sheet_name}")
+        headers = rows[0]
+        parts.append(" | ".join(headers))
+        parts.append("-" * len(" | ".join(headers)))
+        for row in rows[1:]:
+            parts.append(" | ".join(row))
+        parts.append("")
+
+    if suffix == ".xlsx":
+        wb.close()
+
+    parts.append(f"（该表格共 {len(sheet_names)} 个工作表）")
+    return "\n".join(parts)
+
+
+def _csv_to_text(path: Path) -> str:
+    """将 CSV 表格转换为可检索的文本表示。"""
+    import csv
+
+    lines: list[str] = []
+    with path.open("r", encoding="utf-8-sig") as f:
+        reader = csv.reader(f)
+        headers = next(reader, None)
+        if headers:
+            # 表头行
+            lines.append(" | ".join(headers))
+            lines.append("-" * len(" | ".join(headers)))
+        for row in reader:
+            lines.append(" | ".join(row))
+
+    if not lines:
+        return ""
+
+    table_text = "\n".join(lines)
+    return (
+        f"以下为表格文件 [{path.stem}] 的内容：\n\n"
+        f"{table_text}\n\n"
+        f"（该表格共 {len(lines) - 2 if len(lines) >= 2 else 0} 行数据，"
+        f"列：{', '.join(headers) if headers else '无'}）"
+    )
+
+
 def extract_text_from_file(path: Path) -> str:
-    """从 PDF 或 TXT 文件中提取文本。"""
-    if path.suffix.lower() == ".pdf":
+    """从 PDF、TXT、CSV、Excel 文件中提取文本。"""
+    suffix = path.suffix.lower()
+    if suffix == ".pdf":
         if PdfReader is None:
             raise RuntimeError("当前环境缺少 pypdf，请先安装 backend/requirements.txt 中的依赖")
         reader = PdfReader(str(path))
         return "\n".join(page.extract_text() or "" for page in reader.pages)
+    if suffix == ".csv":
+        return _csv_to_text(path)
+    if suffix in (".xlsx", ".xls"):
+        return _excel_to_text(path)
     return path.read_text(encoding="utf-8")
